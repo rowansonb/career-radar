@@ -49,7 +49,7 @@ def total_score(scores: dict, criteria: dict) -> int:
 
 
 _CLIENT = None
-_MODEL = None
+_MODELS: list[str] = []
 _SKIP_WORDS = ("lite", "image", "tts", "live", "audio", "embedding", "exp", "thinking", "computer")
 
 
@@ -59,42 +59,62 @@ def _version_key(name: str) -> tuple:
     return (stable, float(nums[0]) if nums else 0.0, name)  # 정식 버전 우선, 그다음 최신 버전
 
 
-def _resolve_model(client) -> str:
-    """GEMINI_MODEL이 있으면 그걸 쓰고, 없으면 내 키로 쓸 수 있는 최신 Flash 모델을 자동으로 골라요."""
+def _candidate_models(client) -> list[str]:
+    """GEMINI_MODEL이 있으면 그것만, 없으면 쓸 수 있는 Flash 모델을 좋은 순서대로 나열해요."""
     if os.getenv("GEMINI_MODEL"):
-        return os.environ["GEMINI_MODEL"]
+        return [os.environ["GEMINI_MODEL"]]
     names = []
     for m in client.models.list():
         actions = getattr(m, "supported_actions", None) or []
         name = m.name.split("/")[-1]
         if "generateContent" in actions and "flash" in name:
             names.append(name)
-    good = [n for n in names if not any(w in n for w in _SKIP_WORDS)] or names
-    if not good:
-        raise RuntimeError(f"쓸 수 있는 Flash 모델이 없어요. 목록: {names}")
-    return max(good, key=_version_key)
+    good = sorted((n for n in names if not any(w in n for w in _SKIP_WORDS)), key=_version_key, reverse=True)
+    lite = sorted((n for n in names if "lite" in n and not any(w in n for w in _SKIP_WORDS if w != "lite")),
+                  key=_version_key, reverse=True)
+    models = (good[:3] + lite[:1]) or names
+    if not models:
+        raise RuntimeError("쓸 수 있는 Flash 모델이 없어요.")
+    return models
 
 
-def _gemini(prompt: str) -> dict:
-    global _CLIENT, _MODEL
+def _gemini(prompt: str) -> list | dict:
+    """혼잡(503)·한도(429)면 기다렸다 재시도하고, 계속 안 되면 다음 모델로 넘어가요."""
+    global _CLIENT, _MODELS
     from google import genai
     from google.genai import types
 
     if _CLIENT is None:
         _CLIENT = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
-        _MODEL = _resolve_model(_CLIENT)
-        print(f"[judge] 사용 모델: {_MODEL}")
+        _MODELS = _candidate_models(_CLIENT)
+        print(f"[judge] 후보 모델: {_MODELS}")
 
-    resp = _CLIENT.models.generate_content(
-        model=_MODEL,
-        contents=prompt,
-        # 최신 Gemini 모델은 temperature 같은 샘플링 파라미터를 받지 않아서 JSON 출력만 지정해요.
-        config=types.GenerateContentConfig(response_mime_type="application/json"),
-    )
-    text = resp.text.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?|```$", "", text).strip()
-    return json.loads(text)
+    last = None
+    for model in list(_MODELS):
+        for wait in (0, 15, 45):
+            time.sleep(wait)
+            try:
+                resp = _CLIENT.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                    # 최신 Gemini 모델은 temperature 같은 샘플링 파라미터를 받지 않아서 JSON 출력만 지정해요.
+                    config=types.GenerateContentConfig(response_mime_type="application/json"),
+                )
+                text = resp.text.strip()
+                if text.startswith("```"):
+                    text = re.sub(r"^```(?:json)?|```$", "", text).strip()
+                if model != _MODELS[0]:  # 잘 되는 모델을 이번 실행 동안 1순위로
+                    _MODELS.remove(model)
+                    _MODELS.insert(0, model)
+                    print(f"[judge] {model}로 전환")
+                return json.loads(text)
+            except Exception as e:
+                last = e
+                msg = str(e)
+                if not any(code in msg for code in ("503", "429", "UNAVAILABLE", "RESOURCE_EXHAUSTED", "500")):
+                    raise
+        print(f"[judge] {model} 계속 혼잡 → 다음 모델 시도")
+    raise last
 
 
 KEYWORDS = {

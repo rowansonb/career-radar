@@ -8,37 +8,43 @@ import json
 import os
 import re
 import time
+from datetime import datetime, timedelta, timezone
 
 import yaml
 
-PROMPT = """너는 대학생 '민아'의 커리어 코치야. 아래 [민아 정보와 판정 기준]을 보고 [공고]를 판정해.
+PROMPT = """너는 대학생 '민아'의 커리어 코치야. 아래 [민아 정보와 판정 기준]을 보고 [공고 목록]의 각 항목을 판정해.
 기사나 공고 내용에 없는 정보는 추측하지 말고 "확인 필요"라고 써.
-공고가 아니라 단순 뉴스(수상 소식, 행사 후기 등)이면 is_opportunity를 false로 해.
+공고가 아니라 단순 뉴스(수상 소식, 행사 후기, 결과 발표 등)이면 is_opportunity를 false로 해.
+오늘 날짜는 {today}야. 마감이 지난 게 확실하면 is_opportunity를 false로 해.
 
 [민아 정보와 판정 기준]
 {criteria}
 
-[공고]
-제목: {title}
-출처: {source}
-내용: {summary}
-링크: {url}
+[공고 목록]
+{items}
 
-아래 JSON 형식으로만 답해:
-{{
-  "is_opportunity": true/false,
-  "type": "해커톤|공모전|데이터경진대회|부트캠프|연합동아리|대외활동|인턴|기타",
-  "eligible": "가능|불가|확인 필요",
-  "deadline": "YYYY-MM-DD 또는 확인 필요",
-  "scores": {{"role_fit": 0-5, "output": 0-5, "tech_depth": 0-5, "fills_gap": 0-5, "schedule_fit": 0-5, "location_fit": 0-5}},
-  "one_line": "민아한테 이게 왜 좋은지/별로인지 한 줄",
-  "watch_out": "주의할 점 한 줄 (없으면 빈 문자열)"
-}}"""
+공고 목록의 모든 항목에 대해, 아래 형식의 객체를 담은 JSON 배열로만 답해 (idx는 목록 번호 그대로):
+[
+  {{
+    "idx": 0,
+    "is_opportunity": true/false,
+    "type": "해커톤|공모전|데이터경진대회|부트캠프|연합동아리|대외활동|인턴|기타",
+    "eligible": "가능|불가|확인 필요",
+    "deadline": "YYYY-MM-DD 또는 확인 필요",
+    "scores": {{"role_fit": 0-5, "output": 0-5, "tech_depth": 0-5, "fills_gap": 0-5, "schedule_fit": 0-5, "location_fit": 0-5}},
+    "one_line": "민아한테 이게 왜 좋은지/별로인지 한 줄",
+    "watch_out": "주의할 점 한 줄 (없으면 빈 문자열)"
+  }}
+]"""
+
+BATCH_SIZE = 10      # 한 번에 판정할 공고 수
+MAX_PER_RUN = 40     # 한 번 실행에 판정할 최대 개수 (나머지는 다음 실행 때)
+OPPORTUNITY_WORDS = ("모집", "접수", "신청", "참가자", "참가팀", "선발", "공모", "지원자", "리크루팅")
 
 
 def total_score(scores: dict, criteria: dict) -> int:
     weights = {k: v["weight"] for k, v in criteria["scoring"].items()}
-    got = sum(weights[k] * min(max(int(scores.get(k, 0)), 0), 5) for k in weights)
+    got = sum(weights[k] * min(max(int(scores.get(k, 0) or 0), 0), 5) for k in weights)
     return round(got / (sum(weights.values()) * 5) * 100)
 
 
@@ -116,27 +122,58 @@ def _dry_run(item: dict) -> dict:
     }
 
 
+def _looks_like_opportunity(item: dict) -> bool:
+    text = f"{item['title']} {item['summary']}"
+    return item.get("source") == "인박스" or any(w in text for w in OPPORTUNITY_WORDS)
+
+
+def _format_items(batch: list[dict]) -> str:
+    return "\n\n".join(
+        f"[{i}] 제목: {x['title']}\n출처: {x['source']}\n내용: {x['summary'][:600]}\n링크: {x['url']}"
+        for i, x in enumerate(batch)
+    )
+
+
 def judge(items: list[dict], criteria: dict) -> tuple[list[dict], list[str]]:
-    """반환: (추천 공고 목록, '공고 아님'으로 판정된 id 목록). 실패한 건 어디에도 안 들어가서 다음에 재시도돼요."""
+    """반환: (추천 공고 목록, '공고 아님'으로 판정된 id 목록). 실패하거나 이번에 못 본 건 다음에 재시도돼요."""
     use_ai = bool(os.getenv("GEMINI_API_KEY"))
     criteria_text = yaml.safe_dump(criteria, allow_unicode=True, sort_keys=False)
-    results, rejected = [], []
+    today = datetime.now(timezone(timedelta(hours=9))).strftime("%Y-%m-%d")
 
-    for item in items:
+    # 1차 필터: 모집 관련 단어가 없는 단순 뉴스는 AI에 안 보내고 바로 탈락
+    rejected = [x["id"] for x in items if not _looks_like_opportunity(x)]
+    todo = [x for x in items if _looks_like_opportunity(x)]
+    print(f"[judge] 1차 필터 통과 {len(todo)}개 / 탈락 {len(rejected)}개")
+    if len(todo) > MAX_PER_RUN:
+        print(f"[judge] {len(todo) - MAX_PER_RUN}개는 다음 실행 때 판정")
+        todo = todo[:MAX_PER_RUN]
+
+    results = []
+    for start in range(0, len(todo), BATCH_SIZE):
+        batch = todo[start:start + BATCH_SIZE]
         try:
             if use_ai:
-                verdict = _gemini(PROMPT.format(criteria=criteria_text, **item))
-                time.sleep(4)  # 무료 한도(분당 요청 수) 보호
+                verdicts = _gemini(PROMPT.format(criteria=criteria_text, items=_format_items(batch), today=today))
+                if isinstance(verdicts, dict):
+                    verdicts = verdicts.get("results") or [verdicts]
+                time.sleep(5)  # 무료 한도(분당 요청 수) 보호
             else:
-                verdict = _dry_run(item)
-        except Exception as e:  # 한 건 실패해도 전체는 계속
-            print(f"[judge] 실패: {item['title'][:40]} — {e}")
+                verdicts = [{**_dry_run(x), "idx": i} for i, x in enumerate(batch)]
+        except Exception as e:  # 한 묶음 실패해도 전체는 계속
+            print(f"[judge] 묶음 {start // BATCH_SIZE + 1} 실패 — {e}")
             continue
 
-        if not verdict.get("is_opportunity"):
-            rejected.append(item["id"])
-            continue
-        verdict["score"] = 0 if verdict.get("eligible") == "불가" else total_score(verdict["scores"], criteria)
-        results.append({**item, **verdict})
+        for v in verdicts:
+            try:
+                item = batch[int(v["idx"])]
+            except (KeyError, ValueError, IndexError, TypeError):
+                continue
+            if not v.get("is_opportunity"):
+                rejected.append(item["id"])
+                continue
+            v.pop("idx", None)
+            v["score"] = 0 if v.get("eligible") == "불가" else total_score(v.get("scores", {}), criteria)
+            results.append({**item, **v})
+        print(f"[judge] 묶음 {start // BATCH_SIZE + 1}: {len(batch)}개 판정 완료")
 
     return results, rejected

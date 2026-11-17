@@ -1,0 +1,6 @@
+[
+  {"id": "s1", "title": "2027 동계 AI 에이전트 해커톤 참가자 모집 (온라인, 무박 2일)", "url": "https://example.com/1", "summary": "대학생 누구나 팀 단위 참가 가능. LLM 기반 AI 에이전트 서비스를 기획·개발. 온라인 진행, 1월 중 무박 2일. 개발자·기획자 매칭 지원.", "source": "샘플", "published": null},
+  {"id": "s2", "title": "IT 연합동아리 9기 PM 파트 모집", "url": "https://example.com/2", "summary": "개발자, 디자이너와 팀을 이뤄 3개월간 서비스를 기획하고 출시합니다. 온라인 중심, 서울 오프라인 데모데이 1회. 대학생 모집.", "source": "샘플", "published": null},
+  {"id": "s3", "title": "○○대학교 학생, 공모전 대상 수상", "url": "https://example.com/3", "summary": "○○대 학생팀이 지난달 열린 공모전에서 대상을 받았다.", "source": "샘플", "published": null},
+  {"id": "s4", "title": "6개월 국비 AI 엔지니어 부트캠프 수강생 모집", "url": "https://example.com/4", "summary": "졸업예정자 이상 대상, 서울 오프라인 주 5일 풀타임 6개월 과정. 국민내일배움카드 필요.", "source": "샘플", "published": null}
+]

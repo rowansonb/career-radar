@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 
 import yaml
@@ -41,20 +42,53 @@ def total_score(scores: dict, criteria: dict) -> int:
     return round(got / (sum(weights.values()) * 5) * 100)
 
 
+_CLIENT = None
+_MODEL = None
+_SKIP_WORDS = ("lite", "image", "tts", "live", "audio", "embedding", "exp", "thinking", "computer")
+
+
+def _version_key(name: str) -> tuple:
+    nums = re.findall(r"\d+(?:\.\d+)?", name)
+    stable = "preview" not in name
+    return (stable, float(nums[0]) if nums else 0.0, name)  # 정식 버전 우선, 그다음 최신 버전
+
+
+def _resolve_model(client) -> str:
+    """GEMINI_MODEL이 있으면 그걸 쓰고, 없으면 내 키로 쓸 수 있는 최신 Flash 모델을 자동으로 골라요."""
+    if os.getenv("GEMINI_MODEL"):
+        return os.environ["GEMINI_MODEL"]
+    names = []
+    for m in client.models.list():
+        actions = getattr(m, "supported_actions", None) or []
+        name = m.name.split("/")[-1]
+        if "generateContent" in actions and "flash" in name:
+            names.append(name)
+    good = [n for n in names if not any(w in n for w in _SKIP_WORDS)] or names
+    if not good:
+        raise RuntimeError(f"쓸 수 있는 Flash 모델이 없어요. 목록: {names}")
+    return max(good, key=_version_key)
+
+
 def _gemini(prompt: str) -> dict:
+    global _CLIENT, _MODEL
     from google import genai
     from google.genai import types
 
-    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
-    resp = client.models.generate_content(
-        # 'gemini-flash-latest'는 항상 최신 Flash 모델을 가리키는 별칭이에요.
-        # 특정 버전으로 고정하고 싶으면 GitHub 레포 Variables에 GEMINI_MODEL을 넣으세요.
-        model=os.getenv("GEMINI_MODEL") or "gemini-flash-latest",
+    if _CLIENT is None:
+        _CLIENT = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+        _MODEL = _resolve_model(_CLIENT)
+        print(f"[judge] 사용 모델: {_MODEL}")
+
+    resp = _CLIENT.models.generate_content(
+        model=_MODEL,
         contents=prompt,
         # 최신 Gemini 모델은 temperature 같은 샘플링 파라미터를 받지 않아서 JSON 출력만 지정해요.
         config=types.GenerateContentConfig(response_mime_type="application/json"),
     )
-    return json.loads(resp.text)
+    text = resp.text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?|```$", "", text).strip()
+    return json.loads(text)
 
 
 KEYWORDS = {
@@ -82,10 +116,11 @@ def _dry_run(item: dict) -> dict:
     }
 
 
-def judge(items: list[dict], criteria: dict) -> list[dict]:
+def judge(items: list[dict], criteria: dict) -> tuple[list[dict], list[str]]:
+    """반환: (추천 공고 목록, '공고 아님'으로 판정된 id 목록). 실패한 건 어디에도 안 들어가서 다음에 재시도돼요."""
     use_ai = bool(os.getenv("GEMINI_API_KEY"))
     criteria_text = yaml.safe_dump(criteria, allow_unicode=True, sort_keys=False)
-    results = []
+    results, rejected = [], []
 
     for item in items:
         try:
@@ -99,8 +134,9 @@ def judge(items: list[dict], criteria: dict) -> list[dict]:
             continue
 
         if not verdict.get("is_opportunity"):
+            rejected.append(item["id"])
             continue
         verdict["score"] = 0 if verdict.get("eligible") == "불가" else total_score(verdict["scores"], criteria)
         results.append({**item, **verdict})
 
-    return results
+    return results, rejected

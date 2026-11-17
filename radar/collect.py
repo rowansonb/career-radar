@@ -27,6 +27,7 @@ def from_rss(sources: dict) -> list[dict]:
 
     for feed in sources.get("rss", []):
         parsed = feedparser.parse(feed["url"])
+        before = len(items)
         for entry in parsed.entries[:limit]:
             published = None
             if entry.get("published"):
@@ -44,6 +45,7 @@ def from_rss(sources: dict) -> list[dict]:
                 "source": feed["name"],
                 "published": published.isoformat() if published else None,
             })
+        print(f"[collect] {feed['name']}: 피드 {len(parsed.entries)}개 → 최근 것 {len(items) - before}개")
     return items
 
 

@@ -42,12 +42,15 @@ def main() -> None:
     print(f"수집 {len(collected)}개 → 새 공고 {len(fresh)}개 판정 시작")
 
     run_id = datetime.now(KST).strftime("%Y%m%d-%H%M")
-    judged = judge(fresh, criteria)
+    judged, rejected = judge(fresh, criteria)
     for x in judged:
         x["run_id"] = run_id
 
-    # 판정에서 탈락한 것도 id는 기록해서 다음에 다시 판정하지 않게
-    skipped = [{"id": x["id"], "skipped": True} for x in fresh if x["id"] not in {j["id"] for j in judged}]
+    # '공고 아님'으로 판정된 것만 기록 (판정 실패한 건 기록 안 해서 다음 실행 때 재시도)
+    skipped = [{"id": i, "skipped": True} for i in rejected]
+    failed = len(fresh) - len(judged) - len(rejected)
+    if failed:
+        print(f"판정 실패 {failed}개 → 다음 실행 때 재시도")
     history = judged + history + skipped
     DATA.parent.mkdir(exist_ok=True)
     DATA.write_text(json.dumps(history, ensure_ascii=False, indent=1), encoding="utf-8")
